@@ -1,0 +1,24 @@
+{
+  "name": "panel-walencya",
+  "version": "1.0.0",
+  "private": true,
+  "description": "panel WALENCYA — premium multi-protocol proxy panel (VLESS / VMess / Trojan / REALITY on a single port) packaged for KataBump as exactly two files: index.js + package.json. Telegram: https://t.me/WALENCYA_Panel_ir",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "walencya",
+    "xray",
+    "vless",
+    "vmess",
+    "trojan",
+    "reality",
+    "katabump",
+    "panel"
+  ],
+  "license": "MIT"
+}
