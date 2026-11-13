@@ -1,446 +1,363 @@
-// M&F Panel — Cloudflare Worker edition
-// 4 relays over WS+TLS: vless / vmess / shadowsocks / trojan
-// Path: /ws/<tag>/<proto>/<uuid>   (tag = external-proxy label, e.g. de, tr, cdn1)
-// Bindings: KV "DB". Vars: ADMIN_USER, ADMIN_PASS (secret). Optional: PROXYIP, CLEAN_IPS(unused)
-import { connect } from 'cloudflare:sockets';
+// CF Config Panel — Cloudflare Worker edition (single file, no dependencies)
+// Panel + subscription + VLESS/Trojan over WebSocket+TLS, storage in KV.
+//
+// Required bindings (Settings → Bindings / Variables):
+//   KV         : KV namespace (e.g. cf-config-panel-kv)
+//   ADMIN_PASS : secret, panel password
+// Optional variables:
+//   PROXY_IP   : fallback "ip" or "ip:port" for destinations behind Cloudflare
 
-const PROTOS = ['vless', 'vmess', 'shadowsocks', 'trojan'];
-const TLS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-const WS_RE = /^\/ws\/(?:([a-z0-9_-]{1,32})\/)?(vless|vmess|shadowsocks|trojan)\/([0-9a-f-]{36})$/i;
-const HOST_RE = /^[a-z0-9.:-]{1,253}$/i;
-const SS_METHOD = 'aes-128-gcm';
-const te = new TextEncoder(), td = new TextDecoder();
-const cache = new Map();
+import { connect } from "cloudflare:sockets";
 
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const DOH = "https://1.1.1.1/dns-query";
+const DEFAULTS = { addresses: [], port: 443, fp: "chrome", proxyIp: "" };
+
+/* ------------------------------ utils ------------------------------ */
+const hex = (u) => [...u].map((x) => x.toString(16).padStart(2, "0")).join("");
+const json = (o, s = 200, h = {}) =>
+  new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json", "cache-control": "no-store", ...h } });
+const html = (b, s = 200) => new Response(b, { status: s, headers: { "content-type": "text/html;charset=utf-8", "cache-control": "no-store" } });
+const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const safeEq = (a, b) => { if (a.length !== b.length) return false; let r = 0; for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i); return r === 0; };
+async function hmac(key, msg) {
+  const k = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return hex(new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(msg))));
+}
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(s); const u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u;
+}
+const concat = (a, b) => { const o = new Uint8Array(a.length + b.length); o.set(a); o.set(b, a.length); return o; };
+
+// SHA-224 (needed for Trojan; WebCrypto doesn't provide it)
+const K256 = (() => { const k = []; let n = 2; while (k.length < 64) { let p = true; for (let d = 2; d * d <= n; d++) if (n % d === 0) { p = false; break; } if (p) k.push(Math.floor((Math.cbrt(n) % 1) * 4294967296)); n++; } return k; })();
+function sha224hex(str) {
+  const m = enc.encode(str), l = m.length, nb = ((l + 9 + 63) >> 6) << 6;
+  const buf = new Uint8Array(nb); buf.set(m); buf[l] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(nb - 4, (l * 8) >>> 0); dv.setUint32(nb - 8, Math.floor((l * 8) / 4294967296));
+  let H = [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4];
+  const w = new Array(64), rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let o = 0; o < nb; o += 64) {
+    for (let t = 0; t < 16; t++) w[t] = dv.getUint32(o + t * 4);
+    for (let t = 16; t < 64; t++) {
+      const s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+      const s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+      w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let t = 0; t < 64; t++) {
+      const t1 = (h + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K256[t] + w[t]) | 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    H = [H[0] + a | 0, H[1] + b | 0, H[2] + c | 0, H[3] + d | 0, H[4] + e | 0, H[5] + f | 0, H[6] + g | 0, H[7] + h | 0];
+  }
+  return H.slice(0, 7).map((x) => (x >>> 0).toString(16).padStart(8, "0")).join("");
+}
+
+/* --------------------------- storage / auth --------------------------- */
+const getSettings = async (env) => ({ ...DEFAULTS, ...((await env.KV.get("settings", { type: "json", cacheTtl: 60 })) || {}) });
+const userOk = (u) => u && u.enabled && (!u.expire || u.expire > Date.now());
+async function listUsers(env) {
+  const l = await env.KV.list({ prefix: "u:", limit: 1000 });
+  const us = await Promise.all(l.keys.map((k) => env.KV.get(k.name, { type: "json" })));
+  return us.filter(Boolean).sort((a, b) => b.created - a.created);
+}
+async function isAuthed(req, env) {
+  const c = (req.headers.get("cookie") || "").match(/(?:^|;\s*)wp=(\d+)\.([0-9a-f]+)/);
+  if (!c || Number(c[1]) < Date.now()) return false;
+  return safeEq(c[2], await hmac(env.ADMIN_PASS, c[1]));
+}
+
+/* --------------------------- links / subscription --------------------------- */
+function buildLinks(u, s, host) {
+  const addrs = s.addresses.length ? s.addresses : [host];
+  const out = [];
+  addrs.forEach((a, i) => {
+    for (const proto of ["vless", "trojan"]) {
+      const path = encodeURIComponent(`/ws/${proto}/${u.uuid}?ed=2560`);
+      const q = `security=tls&sni=${host}&fp=${s.fp}&alpn=http%2F1.1&type=ws&host=${host}&path=${path}`;
+      const name = encodeURIComponent(`${u.name}-${proto}${addrs.length > 1 ? "-" + (i + 1) : ""}`);
+      const url = proto === "vless"
+        ? `vless://${u.uuid}@${a}:${s.port}?encryption=none&${q}#${name}`
+        : `trojan://${u.uuid}@${a}:${s.port}?${q}#${name}`;
+      out.push({ proto, url });
+    }
+  });
+  return out;
+}
+
+/* ------------------------------- router ------------------------------- */
 export default {
   async fetch(req, env) {
     try {
       const url = new URL(req.url), p = url.pathname;
-      if ((req.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
-        const m = p.match(WS_RE);
-        if (!m) return text('Not found', 404);
-        return await relay(req, env, m[2].toLowerCase(), m[3].toLowerCase(), (m[1] || '').toLowerCase());
-      }
-      if (p === '/') return Response.redirect(url.origin + '/panel', 302);
-      if (p.startsWith('/sub/')) return await sub(p.slice(5), url, env);
-      if (p === '/panel' || p.startsWith('/api/')) {
-        if (!env.ADMIN_PASS || !env.DB) return text('Set ADMIN_PASS and bind KV as DB first.', 500);
-        if (!authed(req, env)) return new Response('Auth required', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="M&F Panel"' } });
-        if (p === '/panel') return new Response(PAGE, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
-        return await api(req, env, url);
-      }
-      return text('Not found', 404);
+      if ((req.headers.get("Upgrade") || "").toLowerCase() === "websocket") return wsEntry(req, env, url);
+      if (p.startsWith("/ws/")) return new Response("Expected WebSocket", { status: 426 });
+      if (!env.KV || !env.ADMIN_PASS)
+        return html(`<meta charset=utf-8><body dir=rtl style="font-family:sans-serif;padding:24px"><h3>تنظیمات ناقص است</h3><p>باید Binding با نام <b>KV</b> و Secret با نام <b>ADMIN_PASS</b> اضافه شود.</p><p>وضعیت: KV ${env.KV ? "✅" : "❌"} | ADMIN_PASS ${env.ADMIN_PASS ? "✅" : "❌"}</p>`, 500);
+      if (p === "/") return Response.redirect(url.origin + "/panel", 302);
+      if (p === "/panel") return html(PANEL_HTML);
+      if (p.startsWith("/sub/")) return sub(env, url, p.slice(5));
+      if (p.startsWith("/api/")) return api(req, env, url, p);
+      return new Response("Not Found", { status: 404 });
     } catch (e) {
-      return text('Error: ' + ((e && e.message) || e), 500);
+      return json({ error: String((e && e.message) || e) }, 500);
     }
   },
 };
 
-const text = (s, status = 200) => new Response(s, { status, headers: { 'content-type': 'text/plain; charset=utf-8' } });
-const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
-const cat = (...a) => { const o = new Uint8Array(a.reduce((s, x) => s + x.length, 0)); let p = 0; for (const x of a) { o.set(x, p); p += x.length; } return o; };
-const sha = async (alg, d) => new Uint8Array(await crypto.subtle.digest(alg, d));
-const b64 = (s) => { let b = ''; for (const x of te.encode(s)) b += String.fromCharCode(x); return btoa(b); };
-
-function safeEq(a, b) {
-  if (a.length !== b.length) return false;
-  let r = 0;
-  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
-}
-function authed(req, env) {
-  const h = req.headers.get('Authorization') || '';
-  if (!h.startsWith('Basic ')) return false;
-  let d; try { d = atob(h.slice(6)); } catch { return false; }
-  const i = d.indexOf(':');
-  if (i < 0) return false;
-  const a = safeEq(d.slice(0, i), String(env.ADMIN_USER || 'admin'));
-  const b = safeEq(d.slice(i + 1), String(env.ADMIN_PASS));
-  return a && b;
+async function sub(env, url, id) {
+  const u = uuidRe.test(id) ? await env.KV.get("u:" + id, { type: "json" }) : null;
+  if (!userOk(u)) return new Response("Forbidden", { status: 403 });
+  const links = buildLinks(u, await getSettings(env), url.hostname).map((l) => l.url).join("\n");
+  return new Response(btoa(links), {
+    headers: {
+      "content-type": "text/plain;charset=utf-8",
+      "profile-update-interval": "6",
+      "subscription-userinfo": `upload=0; download=0; total=0${u.expire ? "; expire=" + Math.floor(u.expire / 1000) : ""}`,
+    },
+  });
 }
 
-// ---------- storage ----------
-const valid = (u) => (u && u.on && (!u.exp || u.exp > Date.now()) ? u : null);
-async function getUser(env, id) {
-  const c = cache.get('u:' + id);
-  if (c && Date.now() - c.t < 30000) return valid(c.v);
-  const u = await env.DB.get('u:' + id, 'json');
-  if (u) cache.set('u:' + id, { v: u, t: Date.now() });
-  return valid(u);
-}
-async function getExt(env) {
-  const c = cache.get('ext');
-  if (c && Date.now() - c.t < 30000) return c.v;
-  const v = (await env.DB.get('cfg:ext', 'json')) || [];
-  cache.set('ext', { v, t: Date.now() });
-  return v;
-}
-
-// ---------- links (external proxy simulation) ----------
-function makeLinks(id, u, host, ext, only) {
-  const list = ext.length ? ext : [{ tag: 'main', address: '', port: 443 }];
-  const out = [];
-  for (const e of list) for (const p of PROTOS) {
-    if (only && !only.includes(p)) continue;
-    const path = `/ws/${e.tag}/${p}/${id}`;
-    const add = e.address || host, port = e.port || 443;
-    const name = `${u.name}-${e.tag}-${p}`, frag = '#' + encodeURIComponent(name);
-    const base = { security: 'tls', sni: host, fp: 'chrome', type: 'ws', host, path };
-    let link;
-    if (p === 'vless') link = `vless://${id}@${add}:${port}?${new URLSearchParams({ encryption: 'none', ...base })}${frag}`;
-    else if (p === 'trojan') link = `trojan://${id}@${add}:${port}?${new URLSearchParams(base)}${frag}`;
-    else if (p === 'vmess') link = 'vmess://' + b64(JSON.stringify({ v: '2', ps: name, add, port: String(port), id, aid: '0', scy: 'zero', net: 'ws', type: 'none', host, path, tls: 'tls', sni: host, fp: 'chrome', alpn: '' }));
-    else link = `ss://${b64(SS_METHOD + ':' + id).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}@${add}:${port}?${new URLSearchParams(base)}${frag}`;
-    out.push({ proto: p, tag: e.tag, name, link });
+async function api(req, env, url, p) {
+  if (p === "/api/login" && req.method === "POST") {
+    const { password = "" } = await req.json().catch(() => ({}));
+    if (!safeEq(await hmac("x", String(password)), await hmac("x", env.ADMIN_PASS))) return json({ error: "رمز اشتباه است" }, 401);
+    const exp = String(Date.now() + 7 * 864e5);
+    return json({ ok: true }, 200, { "set-cookie": `wp=${exp}.${await hmac(env.ADMIN_PASS, exp)}; Path=/; Max-Age=604800; HttpOnly; Secure; SameSite=Strict` });
   }
-  return out;
-}
+  if (!(await isAuthed(req, env))) return json({ error: "unauthorized" }, 401);
+  if (req.method !== "GET" && !(req.headers.get("content-type") || "").includes("application/json")) return json({ error: "bad request" }, 400);
 
-async function sub(id, url, env) {
-  id = id.toLowerCase();
-  if (!/^[0-9a-f-]{36}$/.test(id)) return text('Not found', 404);
-  const u = await getUser(env, id);
-  if (!u) return text('Forbidden', 403);
-  const only = (url.searchParams.get('proto') || '').split(',').filter((x) => PROTOS.includes(x));
-  const links = makeLinks(id, u, url.hostname, await getExt(env), only.length ? only : null);
-  const headers = { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' };
-  if (u.exp) headers['subscription-userinfo'] = `upload=0; download=0; total=0; expire=${Math.floor(u.exp / 1000)}`;
-  return new Response(btoa(links.map((l) => l.link).join('\n')), { headers });
-}
+  if (p === "/api/logout") return json({ ok: true }, 200, { "set-cookie": "wp=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict" });
 
-// ---------- admin API ----------
-async function api(req, env, url) {
-  const p = url.pathname, M = req.method;
-  const body = () => req.json().catch(() => ({}));
-  if (p === '/api/users' && M === 'GET') {
-    const l = await env.DB.list({ prefix: 'u:', limit: 1000 });
-    const us = await Promise.all(l.keys.map(async (k) => ({ id: k.name.slice(2), ...(await env.DB.get(k.name, 'json')) })));
-    return json(us.sort((a, b) => (b.created || 0) - (a.created || 0)));
+  if (p === "/api/state") {
+    const s = await getSettings(env), users = await listUsers(env);
+    return json({
+      host: url.hostname, settings: s,
+      users: users.map((u) => ({ ...u, active: !!userOk(u), sub: `${url.origin}/sub/${u.uuid}`, links: buildLinks(u, s, url.hostname) })),
+    });
   }
-  if (p === '/api/users' && M === 'POST') {
-    const b = await body(), days = Number(b.days) || 0, id = crypto.randomUUID();
-    const u = { name: String(b.name || 'user').slice(0, 40), exp: days > 0 ? Date.now() + days * 864e5 : 0, on: true, created: Date.now() };
-    await env.DB.put('u:' + id, JSON.stringify(u));
-    return json({ id, ...u });
+  if (p === "/api/settings" && req.method === "POST") {
+    const b = await req.json();
+    const addresses = String(b.addresses || "").split(/[\s,]+/).map((x) => x.trim()).filter((x) => /^[A-Za-z0-9.\-:\[\]]+$/.test(x));
+    const port = [443, 2053, 2083, 2087, 2096, 8443].includes(Number(b.port)) ? Number(b.port) : 443;
+    const fp = ["chrome", "firefox", "safari", "ios", "android", "edge", "random"].includes(b.fp) ? b.fp : "chrome";
+    const proxyIp = String(b.proxyIp || "").trim().slice(0, 100);
+    await env.KV.put("settings", JSON.stringify({ addresses, port, fp, proxyIp }));
+    return json({ ok: true });
   }
-  let m = p.match(/^\/api\/users\/([0-9a-f-]{36})$/i);
+  if (p === "/api/user" && req.method === "POST") {
+    const b = await req.json();
+    const name = String(b.name || "user").replace(/[^\w\u0600-\u06FF\- ]/g, "").trim().slice(0, 30) || "user";
+    const days = Math.max(0, parseInt(b.days, 10) || 0);
+    const u = { uuid: crypto.randomUUID(), name, enabled: true, created: Date.now(), expire: days ? Date.now() + days * 864e5 : 0 };
+    await env.KV.put("u:" + u.uuid, JSON.stringify(u));
+    return json({ ok: true });
+  }
+  const m = p.match(/^\/api\/user\/([0-9a-f-]{36})$/);
   if (m) {
-    const id = m[1].toLowerCase(), key = 'u:' + id;
-    cache.delete(key);
-    if (M === 'DELETE') { await env.DB.delete(key); return json({ ok: true }); }
-    if (M === 'PATCH') {
-      const u = await env.DB.get(key, 'json');
-      if (!u) return json({ error: 'not found' }, 404);
-      const b = await body();
-      if (typeof b.on === 'boolean') u.on = b.on;
-      if (b.days !== undefined) { const d = Number(b.days) || 0; u.exp = d > 0 ? Date.now() + d * 864e5 : 0; }
-      await env.DB.put(key, JSON.stringify(u));
-      return json({ id, ...u });
+    const key = "u:" + m[1], u = await env.KV.get(key, { type: "json" });
+    if (!u) return json({ error: "not found" }, 404);
+    if (req.method === "DELETE") { await env.KV.delete(key); return json({ ok: true }); }
+    if (req.method === "PATCH") {
+      const b = await req.json();
+      if (typeof b.enabled === "boolean") u.enabled = b.enabled;
+      if (b.days !== undefined) { const d = parseInt(b.days, 10) || 0; u.expire = d > 0 ? Date.now() + d * 864e5 : 0; }
+      await env.KV.put(key, JSON.stringify(u));
+      return json({ ok: true });
     }
   }
-  m = p.match(/^\/api\/links\/([0-9a-f-]{36})$/i);
-  if (m && M === 'GET') {
-    const id = m[1].toLowerCase(), u = await env.DB.get('u:' + id, 'json');
-    if (!u) return json({ error: 'not found' }, 404);
-    return json(makeLinks(id, u, url.hostname, await getExt(env)));
-  }
-  if (p === '/api/ext' && M === 'GET') return json(await env.DB.get('cfg:ext', 'json') || []);
-  if (p === '/api/ext' && M === 'POST') {
-    const b = await body();
-    const tag = String(b.tag || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32) || 'w' + Math.random().toString(36).slice(2, 6);
-    const port = Number(b.port) || 443, address = String(b.address || '').trim(), proxyip = String(b.proxyip || '').trim();
-    if (!TLS_PORTS.includes(port)) return json({ error: 'port must be one of ' + TLS_PORTS.join(',') }, 400);
-    if ((address && !HOST_RE.test(address)) || (proxyip && !HOST_RE.test(proxyip))) return json({ error: 'bad address' }, 400);
-    const list = ((await env.DB.get('cfg:ext', 'json')) || []).filter((x) => x.tag !== tag);
-    list.push({ tag, address, port, proxyip });
-    await env.DB.put('cfg:ext', JSON.stringify(list)); cache.delete('ext');
-    return json(list);
-  }
-  m = p.match(/^\/api\/ext\/([a-z0-9_-]{1,32})$/);
-  if (m && M === 'DELETE') {
-    const list = ((await env.DB.get('cfg:ext', 'json')) || []).filter((x) => x.tag !== m[1]);
-    await env.DB.put('cfg:ext', JSON.stringify(list)); cache.delete('ext');
-    return json(list);
-  }
-  return json({ error: 'bad request' }, 400);
+  return json({ error: "not found" }, 404);
 }
 
-// ---------- address / crypto helpers ----------
-function readAddr(b, o, t, T) {
-  let addr;
-  if (t === T[0]) { if (o + 4 > b.length) return null; addr = Array.from(b.subarray(o, o + 4)).join('.'); o += 4; }
-  else if (t === T[1]) { const l = b[o++]; addr = td.decode(b.subarray(o, o + l)); o += l; }
-  else if (t === T[2]) {
-    if (o + 16 > b.length) return null;
-    const dv = new DataView(b.buffer, b.byteOffset + o, 16), a = [];
-    for (let i = 0; i < 8; i++) a.push(dv.getUint16(i * 2).toString(16));
-    addr = a.join(':'); o += 16;
-  } else return null;
-  return o > b.length ? null : { addr, o };
-}
-function uuidBytes(id) { const h = id.replace(/-/g, ''); return Uint8Array.from(h.match(/../g), (x) => parseInt(x, 16)); }
-function crc32(b) { let c = -1; for (const x of b) { c ^= x; for (let i = 0; i < 8; i++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1; } return ~c >>> 0; }
-async function gcm(mode, key, iv, data, aad) {
-  const k = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, [mode]);
-  const o = { name: 'AES-GCM', iv }; if (aad) o.additionalData = aad;
-  return new Uint8Array(await crypto.subtle[mode](o, k, data));
-}
-async function ecbDecBlock(key, blk) { // AES-ECB single block via CBC(iv=0)
-  const k = await crypto.subtle.importKey('raw', key, 'AES-CBC', false, ['encrypt', 'decrypt']), iv = new Uint8Array(16);
-  const x = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-CBC', iv }, k, blk.map((v) => v ^ 16))).slice(0, 16);
-  return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, k, cat(blk, x))).slice(0, 16);
-}
-async function hmacWith(hash, key, msg) {
-  if (key.length > 64) key = await hash(key);
-  const k = new Uint8Array(64); k.set(key);
-  return hash(cat(k.map((x) => x ^ 0x5c), await hash(cat(k.map((x) => x ^ 0x36), msg))));
-}
-function kdf(key, ...path) { // VMess AEAD nested-HMAC KDF
-  let hash = (d) => hmacWith((x) => sha('SHA-256', x), te.encode('VMess AEAD KDF'), d);
-  for (const p of path) { const prev = hash, pk = typeof p === 'string' ? te.encode(p) : p; hash = (d) => hmacWith(prev, pk, d); }
-  return hash(key);
+/* ---------------------------- proxy (WebSocket) ---------------------------- */
+async function wsEntry(req, env, url) {
+  const seg = url.pathname.split("/").filter(Boolean);
+  if (seg[0] !== "ws" || seg.length < 3) return new Response("Not Found", { status: 404 });
+  const id = seg[seg.length - 1].toLowerCase(), proto = seg[seg.length - 2];
+  if ((proto !== "vless" && proto !== "trojan") || !uuidRe.test(id) || !env.KV) return new Response("Not Found", { status: 404 });
+  const user = await env.KV.get("u:" + id, { type: "json", cacheTtl: 60 });
+  if (!userOk(user)) return new Response("Forbidden", { status: 403 });
+
+  const pair = new WebSocketPair(), [client, server] = Object.values(pair);
+  server.accept();
+  const early = req.headers.get("sec-websocket-protocol") || "";
+  handleSession(server, proto, user.uuid, early, env).catch(() => closeWs(server));
+  return new Response(null, { status: 101, webSocket: client, headers: early ? { "sec-websocket-protocol": early } : {} });
 }
 
-// ---------- protocols: feed(bytes) -> {target?, udp?, data[]}; wrap(bytes) -> bytes ----------
-function pVless(id) {
-  let ready = false, hdr = null;
-  return {
-    async feed(c) {
-      if (ready) return { data: [c] };
-      if (c.length < 24) throw new Error('short');
-      if (uuidBytes(id).some((v, i) => v !== c[1 + i])) throw new Error('uuid mismatch');
-      let o = 18 + c[17];
-      const cmd = c[o++], port = (c[o] << 8) | c[o + 1], r = readAddr(c, o + 3, c[o + 2], [1, 2, 3]);
-      if (!r) throw new Error('bad addr');
-      ready = true; hdr = new Uint8Array([c[0], 0]);
-      const rest = c.subarray(r.o);
-      if (cmd === 2) { if (port !== 53) throw new Error('udp'); return { udp: true, data: [rest] }; }
-      if (cmd !== 1) throw new Error('cmd');
-      return { target: { host: r.addr, port }, data: [rest] };
+const closeWs = (ws) => { try { if (ws.readyState === 1 || ws.readyState === 2) ws.close(); } catch (e) {} };
+
+async function handleSession(ws, proto, uuid, early, env) {
+  const readable = new ReadableStream({
+    start(c) {
+      ws.addEventListener("message", (e) => c.enqueue(e.data));
+      ws.addEventListener("close", () => { try { c.close(); } catch (e) {} });
+      ws.addEventListener("error", (e) => c.error(e));
+      if (early) { try { c.enqueue(b64urlToBytes(early).buffer); } catch (e) {} }
     },
-    async wrap(c) { if (!hdr) return c; const o = cat(hdr, c); hdr = null; return o; },
-  };
-}
+  });
+  const trojanHash = proto === "trojan" ? sha224hex(uuid) : "";
+  let writer = null, udp = null;
 
-function pTrojan() { // user is authenticated by the uuid in the path
-  let ready = false;
-  return {
-    async feed(c) {
-      if (ready) return { data: [c] };
-      if (c.length < 64 || c[56] !== 13 || c[57] !== 10 || c[58] !== 1) throw new Error('bad trojan');
-      const r = readAddr(c, 60, c[59], [1, 3, 4]);
-      if (!r || r.o + 4 > c.length) throw new Error('bad trojan addr');
-      ready = true;
-      return { target: { host: r.addr, port: (c[r.o] << 8) | c[r.o + 1] }, data: [c.subarray(r.o + 4)] };
-    },
-    async wrap(c) { return c; },
-  };
-}
-
-function pVmess(id) { // AEAD header, security=zero, TCP only
-  let buf = new Uint8Array(0), ready = false, resp = null;
-  return {
-    async feed(c) {
-      if (ready) return { data: [c] };
-      buf = cat(buf, c);
-      if (buf.length < 42) return { data: [] };
-      const cmdKey = await sha('MD5', cat(uuidBytes(id), te.encode('c48619fe-8f02-49e0-b9e9-edf763e17e21')));
-      const authid = buf.slice(0, 16), nonce = buf.slice(34, 42);
-      const a = await ecbDecBlock((await kdf(cmdKey, 'AES Auth ID Encryption')).slice(0, 16), authid);
-      const dv = new DataView(a.buffer), ts = dv.getUint32(0) * 4294967296 + dv.getUint32(4);
-      if (crc32(a.subarray(0, 12)) !== dv.getUint32(12) || Math.abs(Date.now() / 1000 - ts) > 120) throw new Error('vmess auth');
-      const lk = (await kdf(cmdKey, 'VMess Header AEAD Key_Length', authid, nonce)).slice(0, 16);
-      const ln = (await kdf(cmdKey, 'VMess Header AEAD Nonce_Length', authid, nonce)).slice(0, 12);
-      const lp = await gcm('decrypt', lk, ln, buf.slice(16, 34), authid);
-      const hl = (lp[0] << 8) | lp[1];
-      if (buf.length < 42 + hl + 16) return { data: [] };
-      const hk = (await kdf(cmdKey, 'VMess Header AEAD Key', authid, nonce)).slice(0, 16);
-      const hn = (await kdf(cmdKey, 'VMess Header AEAD Nonce', authid, nonce)).slice(0, 12);
-      const h = await gcm('decrypt', hk, hn, buf.slice(42, 42 + hl + 16), authid);
-      if (h[0] !== 1) throw new Error('vmess ver');
-      if ((h[35] & 15) !== 6 || (h[34] & 1)) throw new Error('vmess: set security to zero');
-      if (h[37] !== 1) throw new Error('vmess: tcp only');
-      const r = readAddr(h, 41, h[40], [1, 2, 3]);
-      if (!r) throw new Error('vmess addr');
-      resp = { iv: h.slice(1, 17), key: h.slice(17, 33), v: h[33] };
-      ready = true;
-      return { target: { host: r.addr, port: (h[38] << 8) | h[39] }, data: [buf.subarray(42 + hl + 16)] };
-    },
-    async wrap(c) {
-      if (!resp) return c;
-      const { iv, key, v } = resp; resp = null;
-      const bk = (await sha('SHA-256', key)).slice(0, 16), bi = (await sha('SHA-256', iv)).slice(0, 16);
-      const l = await gcm('encrypt', (await kdf(bk, 'AEAD Resp Header Len Key')).slice(0, 16), (await kdf(bi, 'AEAD Resp Header Len IV')).slice(0, 12), new Uint8Array([0, 4]));
-      const p = await gcm('encrypt', (await kdf(bk, 'AEAD Resp Header Key')).slice(0, 16), (await kdf(bi, 'AEAD Resp Header IV')).slice(0, 12), new Uint8Array([v, 0, 0, 0]));
-      return cat(l, p, c);
-    },
-  };
-}
-
-function pSS(id) { // aes-128-gcm, password = uuid
-  const KL = 16, inc = (n) => { for (let i = 0; i < 12; i++) { n[i] = (n[i] + 1) & 255; if (n[i]) break; } };
-  let buf = new Uint8Array(0), dk = null, dn = new Uint8Array(12), len = -1, got = false, ek = null, en = new Uint8Array(12);
-  const derive = async (salt) => {
-    const ikm = await crypto.subtle.importKey('raw', await sha('MD5', te.encode(id)), 'HKDF', false, ['deriveKey']);
-    return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-1', salt, info: te.encode('ss-subkey') }, ikm, { name: 'AES-GCM', length: 128 }, false, ['encrypt', 'decrypt']);
-  };
-  const dec = async (d) => { const p = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: dn }, dk, d)); inc(dn); return p; };
-  const enc = async (d) => { const p = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: en }, ek, d)); inc(en); return p; };
-  return {
-    async feed(c) {
-      buf = cat(buf, c);
-      const data = []; let target;
-      if (!dk) { if (buf.length < KL) return { data }; dk = await derive(buf.slice(0, KL)); buf = buf.slice(KL); }
-      for (;;) {
-        if (len < 0) { if (buf.length < 18) break; const l = await dec(buf.slice(0, 18)); len = (l[0] << 8) | l[1]; buf = buf.slice(18); if (len > 0x3fff) throw new Error('ss len'); }
-        if (buf.length < len + 16) break;
-        const p = await dec(buf.slice(0, len + 16)); buf = buf.slice(len + 16); len = -1;
-        if (!got) {
-          const r = readAddr(p, 1, p[0], [1, 3, 4]);
-          if (!r || r.o + 2 > p.length) throw new Error('ss addr');
-          got = true; target = { host: r.addr, port: (p[r.o] << 8) | p[r.o + 1] }; data.push(p.subarray(r.o + 2));
-        } else data.push(p);
-      }
-      return { target, data };
-    },
-    async wrap(c) {
-      const out = [];
-      if (!ek) { const salt = crypto.getRandomValues(new Uint8Array(KL)); ek = await derive(salt); out.push(salt); }
-      for (let o = 0; o < c.length; o += 0x3fff) {
-        const p = c.subarray(o, o + 0x3fff);
-        out.push(await enc(new Uint8Array([p.length >> 8, p.length & 255])), await enc(p));
-      }
-      return cat(...out);
-    },
-  };
-}
-
-// ---------- relay ----------
-async function relay(req, env, proto, id, tag) {
-  if (!(await getUser(env, id))) return text('Forbidden', 403);
-  const ext = (await getExt(env)).find((x) => x.tag === tag);
-  const proxyip = (ext && ext.proxyip) || env.PROXYIP || '';
-  const pair = new WebSocketPair(), client = pair[0], ws = pair[1];
-  ws.accept();
-  const sess = proto === 'vless' ? pVless(id) : proto === 'vmess' ? pVmess(id) : proto === 'trojan' ? pTrojan() : pSS(id);
-  const st = { remote: null, writer: null, udp: false, buf: new Uint8Array(0) };
-  let q = Promise.resolve();
-  const end = () => { try { ws.close(); } catch {} try { st.remote && st.remote.close(); } catch {} };
-  const push = (d) => { q = q.then(() => onChunk(d)).catch(end); };
-
-  async function pump(s) {
-    let got = false;
-    try {
-      await s.readable.pipeTo(new WritableStream({
+  const open = async (host, port, first, header) => {
+    const dial = async (h, pt) => {
+      const sock = connect({ hostname: h, port: pt });
+      await sock.opened;
+      if (writer) { try { writer.releaseLock(); } catch (e) {} }
+      writer = sock.writable.getWriter();
+      if (first.length) await writer.write(first);
+      return sock;
+    };
+    const pump = async (sock, hdr, canRetry) => {
+      let got = false;
+      await sock.readable.pipeTo(new WritableStream({
         async write(chunk) {
           got = true;
-          if (ws.readyState !== 1) throw new Error('closed');
-          ws.send(await sess.wrap(chunk));
+          if (ws.readyState !== 1) throw new Error("ws closed");
+          if (hdr) { ws.send(concat(hdr, new Uint8Array(chunk))); hdr = null; } else ws.send(chunk);
         },
-      }));
-    } catch {}
-    return got;
-  }
-  async function startTcp(t, first) {
-    const open = async (host) => {
-      const s = connect({ hostname: host.includes(':') ? `[${host}]` : host, port: t.port });
-      await s.opened;
-      const w = s.writable.getWriter();
-      if (first.length) await w.write(first);
-      st.remote = s; st.writer = w;
-      return s;
+      })).catch(() => {});
+      if (!got && canRetry) return retry();
+      closeWs(ws);
     };
-    let s, viaProxy = false;
-    try { s = await open(t.host); } catch (e) { if (!proxyip) throw e; viaProxy = true; s = await open(proxyip); }
-    (async () => {
-      let got = await pump(s);
-      if (!got && !viaProxy && proxyip) { try { got = await pump(await open(proxyip)); } catch {} }
-      end();
-    })();
-  }
-  function doh(qb) { // VLESS UDP/53 -> DNS over HTTPS
-    fetch('https://1.1.1.1/dns-query', { method: 'POST', headers: { 'content-type': 'application/dns-message' }, body: qb })
-      .then((r) => r.arrayBuffer())
-      .then(async (a) => {
-        const r = new Uint8Array(a);
-        if (ws.readyState === 1) ws.send(await sess.wrap(cat(new Uint8Array([r.length >> 8, r.length & 255]), r)));
-      }).catch(() => {});
-  }
-  function dns(c) {
-    const m = cat(st.buf, c); let o = 0;
-    while (m.length - o >= 2) {
-      const l = (m[o] << 8) | m[o + 1];
-      if (m.length - o - 2 < l) break;
-      doh(m.slice(o + 2, o + 2 + l)); o += 2 + l;
-    }
-    st.buf = m.slice(o);
-  }
-  async function onChunk(d) {
-    if (typeof d === 'string') return;
-    const r = await sess.feed(d instanceof Uint8Array ? d : new Uint8Array(d));
-    if (r.udp) st.udp = true;
-    if (r.target) { await startTcp(r.target, cat(...r.data)); return; }
-    for (const x of r.data) {
-      if (!x.length) continue;
-      if (st.udp) dns(x); else if (st.writer) await st.writer.write(x);
-    }
-  }
+    const retry = async () => {
+      const s = await getSettings(env);
+      const pip = (env.PROXY_IP || s.proxyIp || "").trim();
+      if (!pip) return closeWs(ws);
+      const [h, pt] = pip.split(":");
+      try { pump(await dial(h, Number(pt) || port), header, false); } catch (e) { closeWs(ws); }
+    };
+    try { pump(await dial(host, port), header, true); } catch (e) { await retry(); }
+  };
 
-  ws.addEventListener('message', (e) => push(e.data));
-  ws.addEventListener('close', end);
-  ws.addEventListener('error', end);
-  const early = req.headers.get('Sec-WebSocket-Protocol') || '';
-  if (early) { try { const b = atob(early.replace(/-/g, '+').replace(/_/g, '/')); push(Uint8Array.from(b, (c) => c.charCodeAt(0))); } catch {} }
-  return new Response(null, { status: 101, webSocket: client, headers: early ? { 'Sec-WebSocket-Protocol': early } : undefined });
+  await readable.pipeTo(new WritableStream({
+    async write(chunk) {
+      if (udp) return udp(chunk);
+      if (writer) return writer.write(chunk);
+      const h = proto === "vless" ? parseVless(chunk, uuid) : parseTrojan(chunk, trojanHash);
+      if (h.error) throw new Error(h.error);
+      if (h.cmd === 2) {
+        if (h.port !== 53) throw new Error("udp only dns");
+        udp = makeUdp(ws, h.header);
+        return udp(h.payload);
+      }
+      await open(h.addr, h.port, h.payload, h.header);
+    },
+    close() { },
+  })).catch(() => closeWs(ws));
 }
 
-// ---------- panel UI ----------
-const PAGE = `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>M&F Panel</title>
+function readAddr(u, i, t, domT, v6T) {
+  if (t === 1) return { addr: u.slice(i, i + 4).join("."), i: i + 4 };
+  if (t === domT) { const l = u[i++]; return { addr: dec.decode(u.slice(i, i + l)), i: i + l }; }
+  if (t === v6T) { const x = []; for (let k = 0; k < 8; k++) x.push(((u[i + 2 * k] << 8) | u[i + 2 * k + 1]).toString(16)); return { addr: x.join(":"), i: i + 16 }; }
+  return null;
+}
+
+function parseVless(b, uuid) {
+  const u = new Uint8Array(b);
+  if (u.length < 24) return { error: "short" };
+  if (hex(u.slice(1, 17)) !== uuid.replace(/-/g, "")) return { error: "uuid" };
+  let i = 18 + u[17];
+  const cmd = u[i++];
+  if (cmd !== 1 && cmd !== 2) return { error: "cmd" };
+  const port = (u[i] << 8) | u[i + 1]; i += 2;
+  const t = u[i++];
+  // vless: 1=ipv4, 2=domain, 3=ipv6
+  const r = readAddr(u, i, t, 2, 3);
+  if (!r || !r.addr) return { error: "addr" };
+  return { cmd, port, addr: r.addr, payload: u.slice(r.i), header: new Uint8Array([u[0], 0]) };
+}
+
+function parseTrojan(b, hash) {
+  const u = new Uint8Array(b);
+  if (u.length < 62 || dec.decode(u.slice(0, 56)) !== hash) return { error: "auth" };
+  let i = 58; // skip CRLF
+  const cmd = u[i++];
+  if (cmd !== 1) return { error: "cmd" };
+  const t = u[i++];
+  // trojan: 1=ipv4, 3=domain, 4=ipv6
+  const r = readAddr(u, i, t, 3, 4);
+  if (!r || !r.addr) return { error: "addr" };
+  i = r.i;
+  const port = (u[i] << 8) | u[i + 1]; i += 2;
+  return { cmd: 1, port, addr: r.addr, payload: u.slice(i + 2), header: null };
+}
+
+// UDP is supported for DNS only (resolved through DNS-over-HTTPS)
+function makeUdp(ws, header) {
+  let hdr = header, buf = new Uint8Array(0);
+  return async (chunk) => {
+    buf = concat(buf, new Uint8Array(chunk));
+    while (buf.length >= 2) {
+      const len = (buf[0] << 8) | buf[1];
+      if (buf.length < 2 + len) break;
+      const pkt = buf.slice(2, 2 + len); buf = buf.slice(2 + len);
+      const r = await fetch(DOH, { method: "POST", headers: { "content-type": "application/dns-message" }, body: pkt });
+      const ans = new Uint8Array(await r.arrayBuffer());
+      const out = new Uint8Array((hdr ? hdr.length : 0) + 2 + ans.length);
+      let o = 0;
+      if (hdr) { out.set(hdr, 0); o = hdr.length; hdr = null; }
+      out[o] = ans.length >> 8; out[o + 1] = ans.length & 255; out.set(ans, o + 2);
+      if (ws.readyState === 1) ws.send(out);
+    }
+  };
+}
+
+/* ---------------------------------- UI ---------------------------------- */
+const PANEL_HTML = `<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>CF Config Panel</title>
 <style>
-body{margin:0 auto;background:#080b12;color:#f4f7ff;font:15px system-ui,Tahoma,sans-serif;padding:16px;max-width:900px}
-h1{color:#00f0ff;font-size:20px}h2{font-size:16px;margin:22px 0 6px;color:#9da9bd}
-form{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 14px}
-input,select,button{background:#0f1420;color:inherit;border:1px solid #273248;border-radius:8px;padding:9px 12px;font:inherit}
-button{cursor:pointer}button.p{background:#00f0ff;color:#031319;border:0;font-weight:700}
-.row{background:#0f1420;border:1px solid #273248;border-radius:12px;padding:10px 12px;margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.row b{flex:1 1 120px}.m{color:#9da9bd;font-size:13px}.off{opacity:.55}.lk{display:flex;gap:8px;align-items:center;padding:4px 12px}
-</style></head><body>
-<h1>M&F Panel</h1>
-<h2>External Proxy</h2>
-<form id="fx"><input id="xt" placeholder="تگ/لوکیشن (مثلا de)" size="14">
-<input id="xa" placeholder="آدرس/IP تمیز (خالی = خود Worker)" size="22">
-<select id="xp"><option>443</option><option>2053</option><option>2083</option><option>2087</option><option>2096</option><option>8443</option></select>
-<input id="xi" placeholder="PROXYIP (اختیاری)" size="16"><button class="p">افزودن</button></form>
-<div id="x"></div>
-<h2>کاربران</h2>
-<form id="f"><input id="n" placeholder="نام کاربر" required>
-<input id="d" type="number" min="0" placeholder="روز (۰ = نامحدود)"><button class="p">ساخت کاربر</button></form>
-<div id="l"></div>
-<script>
-function $(i){return document.getElementById(i)}
-async function call(u,m,b){var r=await fetch(u,{method:m||'GET',headers:{'content-type':'application/json'},body:b?JSON.stringify(b):undefined});if(!r.ok)throw new Error(await r.text());return r.json()}
-function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e}
-function btn(t,fn){var e=el('button','',t);e.onclick=function(){fn().catch(function(x){alert(x.message)})};return e}
-function copy(t){navigator.clipboard.writeText(t).catch(function(){prompt('Copy:',t)})}
-async function loadExt(){var l=await call('/api/ext'),b=$('x');b.textContent='';
- if(!l.length)b.append(el('div','m','خالی؛ تگ پیش‌فرض main استفاده می‌شود.'));
- l.forEach(function(e){var r=el('div','row');
-  r.append(el('b','',e.tag),el('span','m',(e.address||'(host)')+':'+e.port+(e.proxyip?' → '+e.proxyip:'')),
-   btn('حذف',async function(){await call('/api/ext/'+e.tag,'DELETE');loadExt()}));b.append(r)})}
-async function load(){var us=await call('/api/users'),b=$('l');b.textContent='';
- if(!us.length){b.textContent='کاربری وجود ندارد.';return}
- us.forEach(function(u){var w=el('div'),r=el('div','row'+(u.on?'':' off')),d=el('div');
-  r.append(el('b','',u.name),el('span','m',u.exp?('انقضا: '+new Date(u.exp).toLocaleDateString('fa-IR')):'نامحدود'),
-   btn('ساب',async function(){copy(location.origin+'/sub/'+u.id)}),
-   btn('کانفیگ‌ها',async function(){if(d.firstChild){d.textContent='';return}
-    (await call('/api/links/'+u.id)).forEach(function(x){var q=el('div','lk');q.append(el('span','m',x.proto+' · '+x.tag),btn('کپی',async function(){copy(x.link)}));d.append(q)})}),
-   btn(u.on?'غیرفعال':'فعال',async function(){await call('/api/users/'+u.id,'PATCH',{on:!u.on});load()}),
-   btn('حذف',async function(){if(confirm('حذف شود؟')){await call('/api/users/'+u.id,'DELETE');load()}}));
-  w.append(r,d);b.append(w)})}
-$('fx').onsubmit=async function(e){e.preventDefault();
- try{await call('/api/ext','POST',{tag:$('xt').value,address:$('xa').value,port:$('xp').value,proxyip:$('xi').value});e.target.reset();loadExt()}catch(x){alert(x.message)}};
-$('f').onsubmit=async function(e){e.preventDefault();
- await call('/api/users','POST',{name:$('n').value,days:$('d').value});e.target.reset();load()};
-loadExt().then(load).catch(function(){$('l').textContent='خطا در بارگذاری'});
+*{box-sizing:border-box}body{margin:0;background:#0d1020;color:#e8e9f5;font:15px/1.6 Tahoma,Vazirmatn,system-ui,sans-serif}
+.w{max-width:720px;margin:0 auto;padding:14px}h1{font-size:18px;margin:6px 0 14px}
+.c{background:#171b33;border:1px solid #262c52;border-radius:12px;padding:12px;margin-bottom:12px}
+input,select,textarea{width:100%;background:#0d1020;color:#fff;border:1px solid #2d3563;border-radius:8px;padding:9px;font:inherit;margin:4px 0}
+button{background:#5b6cff;color:#fff;border:0;border-radius:8px;padding:8px 12px;font:inherit;cursor:pointer;margin:3px 0 3px 4px}
+button.g{background:#252b52}button.r{background:#c0392b}.row{display:flex;gap:8px}.row>*{flex:1}
+.b{font-size:12px;padding:2px 8px;border-radius:99px;background:#1f7a4d}.b.x{background:#8a3b3b}
+code{display:block;direction:ltr;text-align:left;word-break:break-all;font-size:11px;background:#0d1020;padding:6px;border-radius:6px;margin:4px 0}
+.m{opacity:.7;font-size:12px}
+</style></head><body><div class="w" id="app"></div><script>
+function h(t,a){var e=document.createElement(t);a=a||{};for(var k in a){if(k==="onclick")e.onclick=a[k];else if(k==="value")e.value=a[k];else e.setAttribute(k,a[k])}
+for(var i=2;i<arguments.length;i++){[].concat(arguments[i]).forEach(function(x){if(x!=null&&x!==false)e.append(x)})}return e}
+var app=document.getElementById("app");
+function api(p,m,b){return fetch(p,{method:m||"GET",headers:{"content-type":"application/json"},body:b?JSON.stringify(b):undefined}).then(function(r){
+ if(r.status===401&&p!=="/api/login"){loginView();throw 0}return r.json().then(function(j){if(!r.ok)throw new Error(j.error||"خطا");return j})})}
+function copy(t){if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(function(){alert("کپی شد")},function(){prompt("کپی کنید:",t)});else prompt("کپی کنید:",t)}
+function err(e){if(e)alert(e.message||e)}
+function loginView(){app.replaceChildren(h("h1",0,"ورود به پنل"),h("div",{class:"c"},
+ h("input",{id:"pw",type:"password",placeholder:"رمز عبور"}),
+ h("button",{onclick:function(){api("/api/login","POST",{password:document.getElementById("pw").value}).then(load).catch(err)}},"ورود")))}
+function load(){api("/api/state").then(render).catch(function(e){if(e)err(e)})}
+function render(s){
+ var nm=h("input",{placeholder:"نام کاربر"}),dy=h("input",{type:"number",placeholder:"مدت (روز) — خالی = نامحدود"});
+ var ad=h("textarea",{rows:"3",placeholder:"IP/دامنه تمیز (هر خط یکی) — خالی = خود دامنه ورکر"},s.settings.addresses.join("\\n"));
+ var pt=h("select",0,[443,2053,2083,2087,2096,8443].map(function(p){var o=h("option",{value:p},p);if(p===s.settings.port)o.selected=true;return o}));
+ var fp=h("select",0,["chrome","firefox","safari","ios","android","edge","random"].map(function(p){var o=h("option",{value:p},p);if(p===s.settings.fp)o.selected=true;return o}));
+ var px=h("input",{placeholder:"Proxy IP (اختیاری) مثل 1.2.3.4:443",value:s.settings.proxyIp});
+ app.replaceChildren(
+  h("h1",0,"CF Config Panel — "+s.host),
+  h("div",{class:"c"},h("b",0,"کاربر جدید"),nm,dy,h("button",{onclick:function(){api("/api/user","POST",{name:nm.value,days:dy.value}).then(load).catch(err)}},"ساخت")),
+  s.users.map(function(u){
+   var box=h("div");
+   return h("div",{class:"c"},
+    h("div",{class:"row"},h("b",0,u.name),h("span",{class:"b"+(u.active?"":" x")},u.active?"فعال":"غیرفعال")),
+    h("div",{class:"m"},u.expire?"انقضا: "+new Date(u.expire).toLocaleDateString("fa-IR"):"بدون انقضا"),
+    h("button",{onclick:function(){copy(u.sub)}},"کپی لینک ساب"),
+    h("button",{class:"g",onclick:function(){box.hasChildNodes()?box.replaceChildren():box.replaceChildren.apply(box,u.links.map(function(l){return h("div",0,h("code",0,l.url),h("button",{class:"g",onclick:function(){copy(l.url)}},"کپی "+l.proto))}))}},"کانفیگ‌ها"),
+    h("button",{class:"g",onclick:function(){api("/api/user/"+u.uuid,"PATCH",{enabled:!u.enabled}).then(load).catch(err)}},u.enabled?"غیرفعال":"فعال"),
+    h("button",{class:"g",onclick:function(){var d=prompt("تمدید چند روز؟ (0 = نامحدود)","30");if(d!==null)api("/api/user/"+u.uuid,"PATCH",{days:d}).then(load).catch(err)}},"تمدید"),
+    h("button",{class:"r",onclick:function(){if(confirm("حذف شود؟"))api("/api/user/"+u.uuid,"DELETE").then(load).catch(err)}},"حذف"),box)}),
+  h("div",{class:"c"},h("b",0,"تنظیمات"),ad,h("div",{class:"row"},pt,fp),px,
+   h("button",{onclick:function(){api("/api/settings","POST",{addresses:ad.value,port:pt.value,fp:fp.value,proxyIp:px.value}).then(load).catch(err)}},"ذخیره")),
+  h("button",{class:"g",onclick:function(){api("/api/logout","POST",{}).then(loginView)}},"خروج"))}
+load();
 </script></body></html>`;
